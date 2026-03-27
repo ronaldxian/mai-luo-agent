@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="OpenCodeSessionMCP/OpenCodeSessionMCP.csproj" />
+  <Project Path="OpenCodeSessionServer/OpenCodeSessionServer.csproj" Id="cca6e6d1-b232-479a-985e-1370fce1792c" />
+</Solution>
