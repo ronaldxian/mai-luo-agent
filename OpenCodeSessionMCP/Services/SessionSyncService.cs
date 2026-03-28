@@ -1,59 +1,73 @@
 ﻿using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OpenCodeSessionMCP.Configuration;
 using OpenCodeSessionMCP.Models;
+using Serilog;
 
 namespace OpenCodeSessionMCP.Services;
 
-public sealed class SessionSyncService : ISessionSyncService
+public sealed class SessionSyncService
 {
-    private readonly IOpenCodeService _openCodeService;
+    private readonly OpenCodeService _openCodeService;
     private readonly AppSettings _settings;
     private readonly string _workingDirectory;
-    private readonly ILogger<SessionSyncService> _logger;
 
     public SessionSyncService(
-        IOpenCodeService openCodeService, 
-        IOptions<AppSettings> settings,
-        ILogger<SessionSyncService> logger)
+        OpenCodeService openCodeService,
+        IOptions<AppSettings> settings)
     {
         _openCodeService = openCodeService;
         _settings = settings.Value;
         _workingDirectory = Directory.GetCurrentDirectory();
-        _logger = logger;
     }
 
     public async Task<ExportResult> ExportAndUploadAsync(
-        string? sessionId,
-        string? serverUrl,
-        string? apiKey,
+        string sessionId,
         CancellationToken ct = default)
     {
-        _logger.LogInformation("Starting session export. SessionId: {SessionId}, ServerUrl: {ServerUrl}", sessionId, serverUrl ?? _settings.RestApi.BaseUrl);
+        Log.Logger.Information("Starting session export. SessionId: {SessionId}", sessionId);
+
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return CreateExportResult("Session ID is required.", false);
+        }
+
+        string title;
+        try
+        {
+            var (_, foundTitle) = GetSessionInfoByPath(null);
+            title = foundTitle ?? sessionId;
+        }
+        catch
+        {
+            title = sessionId;
+        }
 
         try
         {
-            var exportedFile = await _openCodeService.ExportSessionAsync(sessionId, ct);
-            _logger.LogDebug("OpenCode export completed. File: {File}", exportedFile);
+            var sessionData = await _openCodeService.ExportSessionAsync(sessionId, ct);
+            Log.Logger.Information("Session content length: {Length} characters", sessionData.Length);
 
-            var jsonData = await File.ReadAllTextAsync(exportedFile, ct);
-            _logger.LogDebug("Read exported file, size: {Size} bytes", jsonData.Length);
+            if (string.IsNullOrEmpty(_settings.RestApi.BaseUrl))
+            {
+                Log.Logger.Warning("API settings are not configured. BaseUrl: {BaseUrl}", _settings.RestApi.BaseUrl);
+                return CreateExportResult("API settings are not configured. Please set the BaseUrl in the configuration.", false);
+            }
 
-            var sessionData = JsonDocument.Parse(jsonData);
-            var sessionIdFromFile = sessionData.RootElement.TryGetProperty("id", out var idProp)
-                ? idProp.GetString() ?? sessionId ?? "unknown"
-                : sessionId ?? "unknown";
+            var base64Data = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(sessionData));
+            Log.Logger.Information("Read exported session data, size: {Size} bytes", base64Data.Length);
 
-            var effectiveServerUrl = string.IsNullOrEmpty(serverUrl) ? _settings.RestApi.BaseUrl : serverUrl;
-            var effectiveApiKey = string.IsNullOrEmpty(apiKey) ? _settings.RestApi.ApiKey : apiKey;
+            var effectiveServerUrl = _settings.RestApi.BaseUrl;
+            var effectiveApiKey = _settings.RestApi.ApiKey;
 
-            _logger.LogInformation("Uploading to server: {ServerUrl}", effectiveServerUrl);
+            Log.Logger.Information("Uploading to server: {ServerUrl}", effectiveServerUrl);
 
             var apiService = new RestApiService(new HttpClient(), effectiveServerUrl, effectiveApiKey);
-            var remoteId = await apiService.UploadSessionAsync(sessionIdFromFile, jsonData, ct);
+            var remoteId = await apiService.UploadSessionAsync(sessionId, title, base64Data, ct);
 
-            _logger.LogInformation("Session exported successfully. RemoteId: {RemoteId}", remoteId);
+            Log.Logger.Information("Session exported successfully. RemoteId: {RemoteId}", remoteId);
 
             return new ExportResult
             {
@@ -64,7 +78,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (TimeoutException ex)
         {
-            _logger.LogError(ex, "Export timed out after 60 seconds");
+            Log.Logger.Error(ex, "Export timed out after 60 seconds");
             return new ExportResult
             {
                 Success = false,
@@ -73,7 +87,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (InvalidOperationException ex)
         {
-            _logger.LogError(ex, "OpenCode CLI error during export");
+            Log.Logger.Error(ex, "OpenCode CLI error during export");
             return new ExportResult
             {
                 Success = false,
@@ -82,7 +96,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "API error during upload. ServerUrl: {ServerUrl}", serverUrl ?? _settings.RestApi.BaseUrl);
+            Log.Logger.Error(ex, "API error during upload. ServerUrl: {ServerUrl}", _settings.RestApi.BaseUrl);
             return new ExportResult
             {
                 Success = false,
@@ -91,7 +105,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected error during export");
+            Log.Logger.Error(ex, "Unexpected error during export");
             return new ExportResult
             {
                 Success = false,
@@ -100,52 +114,103 @@ public sealed class SessionSyncService : ISessionSyncService
         }
     }
 
-    public async Task<ImportResult> DownloadAndImportAsync(
-        string remoteId,
-        string? serverUrl,
-        string? apiKey,
-        CancellationToken ct = default)
+    private bool TryFindSessionIdByPath(string? sessionPath, out string sessionId, out string title)
     {
-        _logger.LogInformation("Starting session import. RemoteId: {RemoteId}, ServerUrl: {ServerUrl}", remoteId, serverUrl ?? _settings.RestApi.BaseUrl);
+        Log.Logger.Information("SessionId is not provided, attempting to extract from sessionPath: {SessionPath}", sessionPath);
 
-        string? tempFile = null;
+        sessionId = string.Empty;
+        title = string.Empty;
+        if (string.IsNullOrEmpty(_settings.OpenCode.DbPath)) return false;
+
+        var dbPath = _settings.OpenCode.DbPath;
+        if (dbPath[0] == '%')
+        {
+            dbPath = Environment.ExpandEnvironmentVariables(dbPath);
+        }
+
+        if (string.IsNullOrEmpty(dbPath)) return false;
+
+        if (!File.Exists(dbPath))
+        {
+            Log.Logger.Warning("Database file not found: {DbPath}", dbPath);
+            return false;
+        }
 
         try
         {
-            var effectiveServerUrl = string.IsNullOrEmpty(serverUrl) ? _settings.RestApi.BaseUrl : serverUrl;
-            var effectiveApiKey = string.IsNullOrEmpty(apiKey) ? _settings.RestApi.ApiKey : apiKey;
+            using var connection = new SqliteConnection($"Data Source={dbPath}");
+            connection.Open();
 
-            _logger.LogInformation("Downloading from server: {ServerUrl}", effectiveServerUrl);
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT id, title FROM session 
+                WHERE directory = @directory 
+                ORDER BY time_updated DESC 
+                LIMIT 1";
+            command.Parameters.AddWithValue("@directory", sessionPath ?? string.Empty);
 
-            var apiService = new RestApiService(new HttpClient(), effectiveServerUrl, effectiveApiKey);
+            using var reader = command.ExecuteReader();
+            if (reader.Read())
+            {
+                sessionId = reader.GetString(0);
+                title = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+            }
+
+            Log.Logger.Information("SQLite query executed. SessionId: {SessionId}, Title: {Title}", sessionId, title);
+        }
+        catch (Exception ex)
+        {
+            Log.Logger.Error(ex, "Failed to query SQLite database at: {DbPath}", dbPath);
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(sessionId)) return false;
+
+        Log.Logger.Information("Extracted SessionId: {SessionId}, Title: {Title} from SessionPath: {SessionPath}", sessionId, title, sessionPath);
+        return true;
+    }
+
+    public (string? sessionId, string? title) GetSessionInfoByPath(string sessionPath)
+    {
+        if (TryFindSessionIdByPath(sessionPath, out string sessionId, out string title))
+        {
+            return (sessionId, title);
+        }
+        return (null, null);
+    }
+
+    public async Task<ImportResult> DownloadAndImportAsync(
+        string remoteId, CancellationToken ct = default)
+    {
+        string? tempFile = null;
+        try
+        {
+            Log.Logger.Information("Downloading from server: {ServerUrl}", _settings.RestApi.BaseUrl);
+
+            var apiService = new RestApiService(new HttpClient(), _settings.RestApi.BaseUrl, _settings.RestApi.ApiKey);
             var jsonData = await apiService.DownloadSessionAsync(remoteId, ct);
-            _logger.LogDebug("Downloaded data, size: {Size} bytes", jsonData.Length);
+            Log.Logger.Information("Downloaded data, size: {Size} bytes", jsonData.Length);
 
             tempFile = Path.Combine(_workingDirectory, $"import_{remoteId}_{Guid.NewGuid():N}.json");
             await File.WriteAllTextAsync(tempFile, jsonData, ct);
-            _logger.LogDebug("Saved to temp file: {File}", tempFile);
+            Log.Logger.Information("Saved to temp file: {File}", tempFile);
 
-            _logger.LogInformation("Calling OpenCode import");
+            Log.Logger.Information("Calling OpenCode import");
             await _openCodeService.ImportSessionAsync(tempFile, ct);
-            _logger.LogInformation("OpenCode import completed");
+            Log.Logger.Information("OpenCode import completed");
 
-            var sessionData = JsonDocument.Parse(jsonData);
-            var sessionId = sessionData.RootElement.TryGetProperty("id", out var idProp)
-                ? idProp.GetString()
-                : null;
-
-            _logger.LogInformation("Session imported successfully. SessionId: {SessionId}", sessionId ?? remoteId);
+            Log.Logger.Information("Session imported successfully. SessionId: {SessionId}", remoteId);
 
             return new ImportResult
             {
                 Success = true,
-                SessionId = sessionId ?? remoteId,
+                SessionId = remoteId,
                 Message = $"Session imported successfully"
             };
         }
         catch (TimeoutException ex)
         {
-            _logger.LogError(ex, "Import timed out after 60 seconds");
+            Log.Logger.Error(ex, "Import timed out after 60 seconds");
             return new ImportResult
             {
                 Success = false,
@@ -154,7 +219,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (InvalidOperationException ex)
         {
-            _logger.LogError(ex, "OpenCode CLI error during import");
+            Log.Logger.Error(ex, "OpenCode CLI error during import");
             return new ImportResult
             {
                 Success = false,
@@ -163,7 +228,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "API error during download. RemoteId: {RemoteId}", remoteId);
+            Log.Logger.Error(ex, "API error during download. RemoteId: {RemoteId}", remoteId);
             return new ImportResult
             {
                 Success = false,
@@ -172,7 +237,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected error during import");
+            Log.Logger.Error(ex, "Unexpected error during import");
             return new ImportResult
             {
                 Success = false,
@@ -186,32 +251,24 @@ public sealed class SessionSyncService : ISessionSyncService
                 try
                 {
                     File.Delete(tempFile);
-                    _logger.LogDebug("Deleted temp file: {File}", tempFile);
+                    Log.Logger.Information("Deleted temp file: {File}", tempFile);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to delete temp file: {File}", tempFile);
+                    Log.Logger.Warning(ex, "Failed to delete temp file: {File}", tempFile);
                 }
             }
         }
     }
 
-    public async Task<ListRemoteSessionsResult> ListRemoteSessionsAsync(
-        string? serverUrl,
-        string? apiKey,
-        CancellationToken ct = default)
+    public async Task<ListRemoteSessionsResult> ListRemoteSessionsAsync(CancellationToken ct = default)
     {
-        _logger.LogInformation("Listing remote sessions. ServerUrl: {ServerUrl}", serverUrl ?? _settings.RestApi.BaseUrl);
-
         try
         {
-            var effectiveServerUrl = string.IsNullOrEmpty(serverUrl) ? _settings.RestApi.BaseUrl : serverUrl;
-            var effectiveApiKey = string.IsNullOrEmpty(apiKey) ? _settings.RestApi.ApiKey : apiKey;
-
-            var apiService = new RestApiService(new HttpClient(), effectiveServerUrl, effectiveApiKey);
+            var apiService = new RestApiService(new HttpClient(), _settings.RestApi.BaseUrl, _settings.RestApi.ApiKey);
             var sessions = await apiService.ListSessionsAsync(ct);
 
-            _logger.LogInformation("Found {Count} sessions", sessions.Count);
+            Log.Logger.Information("Found {Count} sessions", sessions.Count);
 
             return new ListRemoteSessionsResult
             {
@@ -221,7 +278,7 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "API error listing sessions. ServerUrl: {ServerUrl}", serverUrl ?? _settings.RestApi.BaseUrl);
+            Log.Logger.Error(ex, "API error listing sessions. ServerUrl: {ServerUrl}", _settings.RestApi.BaseUrl);
             return new ListRemoteSessionsResult
             {
                 Success = false,
@@ -230,12 +287,29 @@ public sealed class SessionSyncService : ISessionSyncService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected error listing sessions");
+            Log.Logger.Error(ex, "Unexpected error listing sessions");
             return new ListRemoteSessionsResult
             {
                 Success = false,
                 Error = $"Unexpected error: {ex.Message}"
             };
         }
+    }
+
+    private ExportResult CreateExportResult(string message, bool success)
+    {
+        if (success)
+        {
+            Log.Logger.Information(message);
+        }
+        else
+        {
+            Log.Logger.Error(message);
+        }
+        return new ExportResult
+        {
+            Success = success,
+            Error = message
+        };
     }
 }

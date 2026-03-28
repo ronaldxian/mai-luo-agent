@@ -1,4 +1,4 @@
-using System.Net.Http.Json;
+﻿using System.Net.Http.Json;
 using System.Text.Json;
 using OpenCodeSessionMCP.Configuration;
 using OpenCodeSessionMCP.Models;
@@ -45,13 +45,14 @@ public sealed class RestApiService : IRestApiService
         };
     }
 
-    public async Task<string> UploadSessionAsync(string sessionId, string jsonData, CancellationToken ct = default)
+    public async Task<string> UploadSessionAsync(string sessionId, string title, string jsonData, CancellationToken ct = default)
     {
         var base64Data = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(jsonData));
         
         var request = new UploadRequest
         {
             SessionId = sessionId,
+            Title = title,
             Data = base64Data
         };
 

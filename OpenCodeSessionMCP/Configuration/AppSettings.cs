@@ -1,4 +1,4 @@
-namespace OpenCodeSessionMCP.Configuration;
+﻿namespace OpenCodeSessionMCP.Configuration;
 
 public sealed class AppSettings
 {
@@ -14,5 +14,6 @@ public sealed class RestApiSettings
 
 public sealed class OpenCodeSettings
 {
-    public string CliPath { get; set; } = "opencode";
+    public string CliPath { get; set; } 
+    public string DbPath { get; set; }
 }

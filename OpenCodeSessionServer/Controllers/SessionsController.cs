@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
 using OpenCodeSessionServer.Models;
 using OpenCodeSessionServer.Services;
 
@@ -38,9 +38,9 @@ public class SessionsController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("Listing today's sessions");
-            var sessions = await _sessionService.ListTodaySessionsAsync();
-            return Ok(sessions);
+            _logger.LogInformation("Listing all sessions");
+            var sessions = await _sessionService.ListSessionsAsync();
+            return Ok(new { Sessions = sessions });
         }
         catch (Exception ex)
         {

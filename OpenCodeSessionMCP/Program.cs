@@ -1,25 +1,27 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol.Protocol;
 using OpenCodeSessionMCP.Configuration;
 using OpenCodeSessionMCP.Services;
 using Serilog;
 
+var builder = Host.CreateApplicationBuilder(args);
+
 Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Debug()
+    .ReadFrom.Configuration(builder.Configuration)
     .CreateLogger();
 
-var builder = Host.CreateApplicationBuilder(args);
-builder.Services.AddLogging(logging =>
+builder.Services.AddLogging(b =>
 {
-    logging.AddSerilog();
-    logging.SetMinimumLevel(LogLevel.Trace);
+    b.AddSerilog();
 });
-
+builder.Services.Configure<AppSettings>(builder.Configuration.GetSection("App"));
 builder.Services.AddHttpClient();
 builder.Services.Configure<AppSettings>(builder.Configuration);
-builder.Services.AddSingleton<IOpenCodeService, OpenCodeService>();
-builder.Services.AddSingleton<ISessionSyncService, SessionSyncService>();
+builder.Services.AddSingleton<OpenCodeService>();
+builder.Services.AddSingleton<SessionSyncService>();
 
 builder.Services
     .AddMcpServer()

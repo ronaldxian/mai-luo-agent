@@ -4,160 +4,163 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OpenCodeSessionMCP.Configuration;
 using OpenCodeSessionMCP.Models;
+using Serilog;
 
 namespace OpenCodeSessionMCP.Services;
 
-public sealed class OpenCodeService : IOpenCodeService
+public sealed class OpenCodeService
 {
     private readonly string _cliPath;
     private readonly TimeSpan _timeout = TimeSpan.FromSeconds(60);
-    private readonly ILogger<OpenCodeService> _logger;
 
-    public OpenCodeService(IOptions<AppSettings> settings, ILogger<OpenCodeService> logger)
+    public OpenCodeService(IOptions<AppSettings> settings)
     {
         _cliPath = settings.Value.OpenCode.CliPath;
-        _logger = logger;
     }
 
-    public async Task<string> ExportSessionAsync(string? sessionId, CancellationToken ct = default)
+    public async Task<string> ExportSessionAsync(string sessionId, CancellationToken ct = default)
     {
-        var args = string.IsNullOrEmpty(sessionId) ? "export" : $"export {sessionId}";
-        _logger.LogDebug("Executing: opencode {Args}", args);
+        var args = $"export {sessionId}";
+        Log.Logger.Information("Executing: opencode {Args}", args);
 
-        var (exitCode, output, error) = await RunCommandAsync(args, ct);
+        var (exitCode, output, error) = await RunCommandAsync(["export", sessionId], ct);
 
         if (exitCode != 0)
         {
-            _logger.LogError("OpenCode export failed. ExitCode: {ExitCode}, Error: {Error}", exitCode, error);
+            Log.Logger.Error("OpenCode export failed. ExitCode: {ExitCode}, Error: {Error}", exitCode, error);
             throw new InvalidOperationException($"OpenCode export failed: {error}");
         }
 
-        _logger.LogDebug("OpenCode export output: {Output}", output);
-
-        var exportedFile = FindExportedFile(output);
-        if (string.IsNullOrEmpty(exportedFile))
-        {
-            _logger.LogError("Could not find exported file from output: {Output}", output);
-            throw new InvalidOperationException($"Could not find exported file from output: {output}");
-        }
-
-        _logger.LogDebug("Exported file path: {File}", exportedFile);
-        return exportedFile;
+        return output;
     }
 
     public async Task ImportSessionAsync(string filePath, CancellationToken ct = default)
     {
         var args = $"import \"{filePath}\"";
-        _logger.LogDebug("Executing: opencode {Args}", args);
+        Log.Logger.Information("Executing: opencode {Args}", args);
 
-        var (exitCode, output, error) = await RunCommandAsync(args, ct);
+        var (exitCode, output, error) = await RunCommandAsync(["import", filePath], ct);
 
         if (exitCode != 0)
         {
-            _logger.LogError("OpenCode import failed. ExitCode: {ExitCode}, Error: {Error}", exitCode, error);
+            Log.Logger.Error("OpenCode import failed. ExitCode: {ExitCode}, Error: {Error}", exitCode, error);
             throw new InvalidOperationException($"OpenCode import failed: {error}");
         }
 
-        _logger.LogDebug("OpenCode import completed successfully");
+        Log.Logger.Information("OpenCode import completed successfully");
     }
 
     public async Task<IReadOnlyList<SessionInfo>> ListSessionsAsync(CancellationToken ct = default)
     {
         var args = "session list --format json";
-        _logger.LogDebug("Executing: opencode {Args}", args);
+        Log.Logger.Information("Executing: opencode {Args}", args);
 
-        var (exitCode, output, error) = await RunCommandAsync(args, ct);
+        var (exitCode, output, error) = await RunCommandAsync(["session", "list", "--format", "json"], ct);
 
         if (exitCode != 0)
         {
-            _logger.LogError("OpenCode session list failed. ExitCode: {ExitCode}, Error: {Error}", exitCode, error);
+            Log.Logger.Error("OpenCode session list failed. ExitCode: {ExitCode}, Error: {Error}", exitCode, error);
             throw new InvalidOperationException($"OpenCode session list failed: {error}");
         }
 
         try
         {
             var sessions = JsonSerializer.Deserialize<List<SessionInfo>>(output);
-            _logger.LogDebug("Listed {Count} sessions", sessions?.Count ?? 0);
+            Log.Logger.Information("Listed {Count} sessions", sessions?.Count ?? 0);
             return sessions ?? [];
         }
         catch (JsonException ex)
         {
-            _logger.LogError(ex, "Failed to parse session list JSON");
+            Log.Logger.Error(ex, "Failed to parse session list JSON");
             throw new InvalidOperationException($"Failed to parse session list: {ex.Message}", ex);
         }
     }
 
-    private async Task<(int exitCode, string output, string error)> RunCommandAsync(string arguments, CancellationToken ct)
+    private async Task<(int exitCode, string output, string error)> RunCommandAsync(string[] arguments, CancellationToken ct)
     {
-        using var process = new Process
+        var startInfo = new ProcessStartInfo
         {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = _cliPath,
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }
+            FileName = _cliPath,
+            Arguments = string.Join(" ", arguments),
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+            CreateNoWindow = true,
+            WorkingDirectory = Directory.GetCurrentDirectory()
         };
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(_timeout);
+        foreach (var envKey in Environment.GetEnvironmentVariables().Keys)
+        {
+            if (envKey is string key && !string.IsNullOrEmpty(key))
+            {
+                var value = Environment.GetEnvironmentVariable(key);
+                if (!string.IsNullOrEmpty(value))
+                {
+                    startInfo.Environment[key] = value;
+                }
+            }
+        }
+
+        using var process = new Process { StartInfo = startInfo };
+        using var timeoutCts = new CancellationTokenSource(_timeout);
 
         try
         {
-            _logger.LogDebug("Starting process: {FileName} {Arguments}", _cliPath, arguments);
+            Log.Logger.Information("Starting process: {FileName} {Arguments} in {WorkingDirectory}",
+                _cliPath, string.Join(" ", arguments), startInfo.WorkingDirectory);
             process.Start();
 
-            var outputTask = process.StandardOutput.ReadToEndAsync(cts.Token);
-            var errorTask = process.StandardError.ReadToEndAsync(cts.Token);
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
 
-            await process.WaitForExitAsync(cts.Token);
+            using var timeoutRegistration = timeoutCts.Token.Register(() =>
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill(entireProcessTree: true);
+                        Log.Logger.Warning("Process killed due to timeout");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Logger.Error(ex, "Failed to kill process during timeout");
+                }
+            });
 
+            var waitTask = process.WaitForExitAsync(ct);
+
+            var completedTask = await Task.WhenAny(waitTask, Task.Delay(Timeout.Infinite, ct));
+
+            if (!waitTask.IsCompleted)
+            {
+                throw new TimeoutException($"Command timed out after {_timeout.TotalSeconds} seconds");
+            }
+
+            var exitCode = process.ExitCode;
             var output = await outputTask;
             var error = await errorTask;
 
-            _logger.LogDebug("Process completed. ExitCode: {ExitCode}", process.ExitCode);
+            Log.Logger.Information("Process completed. ExitCode: {ExitCode}", exitCode);
 
-            return (process.ExitCode, output.Trim(), error.Trim());
+            return (exitCode, output.Trim(), error.Trim());
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            Log.Logger.Warning("Process timed out after {Timeout} seconds", _timeout.TotalSeconds);
+            throw new TimeoutException($"Command timed out after {_timeout.TotalSeconds} seconds");
         }
         catch (OperationCanceledException)
         {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-                _logger.LogWarning("Process killed due to timeout");
-            }
-            catch
-            {
-            }
-
-            throw new TimeoutException($"Command timed out after {_timeout.TotalSeconds} seconds");
+            Log.Logger.Warning("Process cancelled");
+            throw;
         }
-    }
-
-    private static string FindExportedFile(string output)
-    {
-        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        foreach (var line in lines)
+        catch (Exception ex)
         {
-            if (line.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
-            {
-                return line.Trim();
-            }
+            Log.Logger.Error(ex, "Process execution failed");
+            throw;
         }
-
-        if (output.Contains(".json"))
-        {
-            var startIndex = output.LastIndexOf('"') + 1;
-            var endIndex = output.LastIndexOf(".json") + 4;
-            if (startIndex < endIndex && endIndex <= output.Length)
-            {
-                return output[startIndex..endIndex];
-            }
-        }
-
-        return output.Trim();
     }
 }

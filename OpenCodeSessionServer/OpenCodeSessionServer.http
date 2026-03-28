@@ -1,6 +1,22 @@
 @OpenCodeSessionServer_HostAddress = http://localhost:5153
 
-GET {{OpenCodeSessionServer_HostAddress}}/weatherforecast/
+### 上传会话
+POST {{OpenCodeSessionServer_HostAddress}}/sessions/upload
+Content-Type: application/json
+
+{
+  "sessionId": "test-session-001",
+  "title": "Test Session",
+  "data": "eyJzZXNzaW9uSWQiOiAidGVzdC1zZXNzaW9uLTAwMSIsICJ0aXRsZSI6ICJUZXN0IFNlc3Npb24ifQ=="
+}
+
+### 列出会话
+GET {{OpenCodeSessionServer_HostAddress}}/sessions
 Accept: application/json
 
-###
+### 下载会话
+GET {{OpenCodeSessionServer_HostAddress}}/sessions/test-session-001
+Accept: application/json
+
+### 删除会话
+DELETE {{OpenCodeSessionServer_HostAddress}}/sessions/test-session-001

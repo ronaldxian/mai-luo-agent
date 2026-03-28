@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace OpenCodeSessionMCP.Models;
 
@@ -25,6 +25,9 @@ public sealed class RemoteSession
     [JsonPropertyName("sessionId")]
     public string SessionId { get; set; } = string.Empty;
 
+    [JsonPropertyName("sessionPath")]
+    public string SessionPath { get; set; } = string.Empty;
+
     [JsonPropertyName("title")]
     public string Title { get; set; } = string.Empty;
 
@@ -46,6 +49,9 @@ public sealed class UploadRequest
     [JsonPropertyName("sessionId")]
     public string SessionId { get; set; } = string.Empty;
 
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = string.Empty;
+
     [JsonPropertyName("data")]
     public string Data { get; set; } = string.Empty;
 }
@@ -63,6 +69,9 @@ public sealed class DownloadResponse
 {
     [JsonPropertyName("sessionId")]
     public string SessionId { get; set; } = string.Empty;
+
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = string.Empty;
 
     [JsonPropertyName("data")]
     public string Data { get; set; } = string.Empty;
