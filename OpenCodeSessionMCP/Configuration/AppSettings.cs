@@ -15,5 +15,4 @@ public sealed class RestApiSettings
 public sealed class OpenCodeSettings
 {
     public string CliPath { get; set; } 
-    public string DbPath { get; set; }
 }

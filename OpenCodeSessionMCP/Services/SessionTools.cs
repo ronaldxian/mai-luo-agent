@@ -80,12 +80,12 @@ public static class SessionTools
     }
 
     [McpServerTool, Description("获取会话标题和ID")]
-    public static string GetSessionInfo(
+    public static async Task<string> GetSessionInfo(
         IServiceProvider serviceProvider,
         [Description("会话目录路径")] string sessionPath)
     {
         var sessionSyncService = serviceProvider.GetRequiredService<SessionSyncService>();
-        var (sessionId, title) = sessionSyncService.GetSessionInfoByPath(sessionPath);
+        var (sessionId, title) = await sessionSyncService.GetSessionInfoByPathAsync(sessionPath);
 
         if (sessionId == null)
         {

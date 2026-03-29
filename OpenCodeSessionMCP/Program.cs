@@ -10,6 +10,7 @@ using Serilog;
 var builder = Host.CreateApplicationBuilder(args);
 
 Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Warning()
     .ReadFrom.Configuration(builder.Configuration)
     .CreateLogger();
 

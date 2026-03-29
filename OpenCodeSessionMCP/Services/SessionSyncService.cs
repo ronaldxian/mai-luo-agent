@@ -37,7 +37,7 @@ public sealed class SessionSyncService
         string title;
         try
         {
-            var (_, foundTitle) = GetSessionInfoByPath(null);
+            var (_, foundTitle) = await GetSessionInfoByPathAsync(null, ct);
             title = foundTitle ?? sessionId;
         }
         catch
@@ -114,26 +114,30 @@ public sealed class SessionSyncService
         }
     }
 
-    private bool TryFindSessionIdByPath(string? sessionPath, out string sessionId, out string title)
+    private async Task<(string? sessionId, string? title)> TryFindSessionIdByPathAsync(string? sessionPath, CancellationToken ct)
     {
         Log.Logger.Information("SessionId is not provided, attempting to extract from sessionPath: {SessionPath}", sessionPath);
 
-        sessionId = string.Empty;
-        title = string.Empty;
-        if (string.IsNullOrEmpty(_settings.OpenCode.DbPath)) return false;
+        string sessionId = string.Empty;
+        string title = string.Empty;
 
-        var dbPath = _settings.OpenCode.DbPath;
-        if (dbPath[0] == '%')
+        string dbPath;
+        try
         {
-            dbPath = Environment.ExpandEnvironmentVariables(dbPath);
+            dbPath = await _openCodeService.GetDatabasePathAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            Log.Logger.Error(ex, "Failed to get database path from opencode");
+            return (null, null);
         }
 
-        if (string.IsNullOrEmpty(dbPath)) return false;
+        if (string.IsNullOrEmpty(dbPath)) return (null, null);
 
         if (!File.Exists(dbPath))
         {
             Log.Logger.Warning("Database file not found: {DbPath}", dbPath);
-            return false;
+            return (null, null);
         }
 
         try
@@ -161,22 +165,18 @@ public sealed class SessionSyncService
         catch (Exception ex)
         {
             Log.Logger.Error(ex, "Failed to query SQLite database at: {DbPath}", dbPath);
-            return false;
+            return (null, null);
         }
 
-        if (string.IsNullOrEmpty(sessionId)) return false;
+        if (string.IsNullOrEmpty(sessionId)) return (null, null);
 
         Log.Logger.Information("Extracted SessionId: {SessionId}, Title: {Title} from SessionPath: {SessionPath}", sessionId, title, sessionPath);
-        return true;
+        return (sessionId, title);
     }
 
-    public (string? sessionId, string? title) GetSessionInfoByPath(string sessionPath)
+    public async Task<(string? sessionId, string? title)> GetSessionInfoByPathAsync(string sessionPath, CancellationToken ct = default)
     {
-        if (TryFindSessionIdByPath(sessionPath, out string sessionId, out string title))
-        {
-            return (sessionId, title);
-        }
-        return (null, null);
+        return await TryFindSessionIdByPathAsync(sessionPath, ct);
     }
 
     public async Task<ImportResult> DownloadAndImportAsync(

@@ -15,7 +15,49 @@ public sealed class OpenCodeService
 
     public OpenCodeService(IOptions<AppSettings> settings)
     {
-        _cliPath = settings.Value.OpenCode.CliPath;
+        var configuredPath = settings.Value.OpenCode.CliPath;
+        _cliPath = ResolveOpenCodePath(configuredPath);
+    }
+
+    private static string ResolveOpenCodePath(string configuredPath)
+    {
+        if (string.IsNullOrEmpty(configuredPath) || configuredPath == "opencode")
+        {
+            try
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = "-NoProfile -Command \"(Get-Command opencode -ErrorAction SilentlyContinue).Source\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var process = Process.Start(startInfo);
+                if (process != null)
+                {
+                    var output = process.StandardOutput.ReadToEnd();
+                    process.WaitForExit(5000);
+                    if (!string.IsNullOrWhiteSpace(output))
+                    {
+                        var resolvedPath = output.Trim();
+                        if (!string.IsNullOrEmpty(resolvedPath) && File.Exists(resolvedPath))
+                        {
+                            Log.Logger.Information("Resolved opencode path: {Path}", resolvedPath);
+                            return resolvedPath;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Logger.Warning(ex, "Failed to resolve opencode path via PowerShell");
+            }
+        }
+
+        return configuredPath;
     }
 
     public async Task<string> ExportSessionAsync(string sessionId, CancellationToken ct = default)
@@ -74,6 +116,28 @@ public sealed class OpenCodeService
             Log.Logger.Error(ex, "Failed to parse session list JSON");
             throw new InvalidOperationException($"Failed to parse session list: {ex.Message}", ex);
         }
+    }
+
+    public async Task<string> GetDatabasePathAsync(CancellationToken ct = default)
+    {
+        Log.Logger.Information("Executing: opencode db path");
+
+        var (exitCode, output, error) = await RunCommandAsync(["db", "path"], ct);
+
+        if (exitCode != 0)
+        {
+            Log.Logger.Error("OpenCode db path failed. ExitCode: {ExitCode}, Error: {Error}", exitCode, error);
+            throw new InvalidOperationException($"OpenCode db path failed: {error}");
+        }
+
+        if (string.IsNullOrWhiteSpace(output))
+        {
+            Log.Logger.Error("OpenCode db path returned empty output");
+            throw new InvalidOperationException("OpenCode db path returned empty output");
+        }
+
+        Log.Logger.Information("Database path: {DbPath}", output);
+        return output;
     }
 
     private async Task<(int exitCode, string output, string error)> RunCommandAsync(string[] arguments, CancellationToken ct)
