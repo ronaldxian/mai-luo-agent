@@ -22,6 +22,7 @@ builder.Services.Configure<AppSettings>(builder.Configuration.GetSection("App"))
 builder.Services.AddHttpClient();
 builder.Services.Configure<AppSettings>(builder.Configuration);
 builder.Services.AddSingleton<OpenCodeService>();
+builder.Services.AddSingleton<GistService>();
 builder.Services.AddSingleton<SessionSyncService>();
 
 builder.Services

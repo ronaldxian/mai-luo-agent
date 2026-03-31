@@ -4,48 +4,51 @@
 
 ```
 MaiLuoAgent.slnx
-├── OpenCodeSessionMCP/          # MCP 客户端 (ModelContextProtocol SDK)
-│   ├── OpenCodeSessionMCP.csproj
-│   ├── Program.cs
-│   ├── appsettings.json
-│   ├── Configuration/
-│   ├── Models/
-│   └── Services/
-└── OpenCodeSessionServer/        # REST API 服务器
-    ├── OpenCodeSessionServer.csproj
+└── OpenCodeSessionMCP/          # MCP 客户端 (ModelContextProtocol SDK)
+    ├── OpenCodeSessionMCP.csproj
     ├── Program.cs
     ├── appsettings.json
-    ├── Controllers/
+    ├── Configuration/
+    │   └── AppSettings.cs
     ├── Models/
+    │   └── SessionData.cs
     └── Services/
+        ├── SessionTools.cs       # MCP 工具定义
+        ├── SessionSyncService.cs  # 核心业务逻辑
+        ├── OpenCodeService.cs    # OpenCode CLI 封装
+        ├── GistService.cs        # GitHub Gist API 封装
+        └── RegistryService.cs     # 本地注册表
 ```
+
+## 架构
+
+```
+OpenCode → MCP → GitHub Gist API → GitHub Gist
+                    ↓
+            本地 Registry (sessionId ↔ gistId 映射)
+```
+
+## 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `GITHUB_TOKEN` | GitHub Personal Access Token (必须) |
 
 ## 构建命令
 
-### 构建整个解决方案
+### 构建项目
 ```bash
 dotnet build MaiLuoAgent.slnx
 ```
 
-### 构建单个项目
-```bash
-dotnet build OpenCodeSessionMCP/OpenCodeSessionMCP.csproj
-dotnet build OpenCodeSessionServer/OpenCodeSessionServer.csproj
-```
-
 ### 运行项目
 ```bash
-# 运行 MCP 客户端
 dotnet run --project OpenCodeSessionMCP
-
-# 运行 API 服务器
-dotnet run --project OpenCodeSessionServer
 ```
 
 ### 发布项目
 ```bash
 dotnet publish OpenCodeSessionMCP/OpenCodeSessionMCP.csproj -c Release -o ./publish/mcp
-dotnet publish OpenCodeSessionServer/OpenCodeSessionServer.csproj -c Release -o ./publish/server
 ```
 
 ## 技术栈
@@ -58,6 +61,17 @@ dotnet publish OpenCodeSessionServer/OpenCodeSessionServer.csproj -c Release -o 
 | 数据库 | Microsoft.Data.Sqlite 10.0.0 |
 | 日志 | Serilog |
 | JSON | System.Text.Json (camelCase) |
+
+## MCP 工具
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `hello` | - | 测试工具 |
+| `get_session_info` | `sessionPath` | 获取本地 session ID 和 title |
+| `export_session` | `sessionId` | 导出到 GitHub Gist |
+| `import_session` | `sessionId` | 从 GitHub Gist 导入 |
+| `list_sessions` | - | 列出已同步的会话 |
+| `delete_session` | `sessionId` | 删除 Gist 中的会话 |
 
 ## 代码风格规范
 
@@ -119,17 +133,17 @@ public sealed class ExportResult
 使用构造函数注入：
 
 ```csharp
-public sealed class SessionSyncService : ISessionSyncService
+public sealed class SessionSyncService
 {
-    private readonly IOpenCodeService _openCodeService;
-    private readonly ILogger<SessionSyncService> _logger;
+    private readonly OpenCodeService _openCodeService;
+    private readonly GistService _gistService;
 
     public SessionSyncService(
-        IOpenCodeService openCodeService,
-        ILogger<SessionSyncService> logger)
+        OpenCodeService openCodeService,
+        GistService gistService)
     {
         _openCodeService = openCodeService;
-        _logger = logger;
+        _gistService = gistService;
     }
 }
 ```
@@ -137,31 +151,14 @@ public sealed class SessionSyncService : ISessionSyncService
 ### 文件组织
 
 - 每个文件一个公共类/记录
-- 按功能分组：Models、Services、Controllers
+- 按功能分组：Models、Services
 - 配置类放在 `Configuration/` 文件夹
-- 接口与实现放在同一文件夹，使用 `I` 前缀区分
 
 ### 异步编程
 
 - I/O 操作使用 `async Task`
 - 为可取消操作提供 `CancellationToken` 参数
 - 默认值: `CancellationToken ct = default`
-
-### HTTP 客户端使用
-
-- 为每个请求创建新的 `HttpClient()` 实例或使用 `IHttpClientFactory`
-- HTTP 错误使用 `HttpRequestException`
-- 错误信息包含状态码和响应体
-
-### 环境变量路径
-
-支持 `%环境变量%` 格式的路径：
-
-```csharp
-var dbPath = config.DbPath[0] == '%'
-    ? Environment.ExpandEnvironmentVariables(config.DbPath)
-    : config.DbPath;
-```
 
 ### MCP 工具定义
 
@@ -174,11 +171,8 @@ public static class SessionTools
     [McpServerTool, Description("工具描述")]
     public static async Task<string> ToolName(
         IServiceProvider serviceProvider,
-        ISessionSyncService sessionSyncService,
         [Description("参数描述")] string? param = null)
     {
-        var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("SessionTools");
-        logger?.LogInformation("Tool called. Param: {Param}", param);
         // 实现...
     }
 }
@@ -195,76 +189,69 @@ using var connection = new SqliteConnection($"Data Source={dbPath}");
 connection.Open();
 
 using var command = connection.CreateCommand();
-command.CommandText = "SELECT id FROM session WHERE directory = @dir LIMIT 1";
-command.Parameters.AddWithValue("@dir", sessionPath);
+command.CommandText = "SELECT id, title FROM session WHERE directory = @directory LIMIT 1";
+command.Parameters.AddWithValue("@directory", sessionPath);
 
-var result = command.ExecuteScalar();
+using var reader = command.ExecuteReader();
+if (reader.Read())
+{
+    sessionId = reader.GetString(0);
+    title = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+}
 ```
 
-## 项目特定规范
+### GitHub Gist API
 
-### OpenCodeSessionMCP
+使用 `HttpClient` 直接调用 GitHub API：
 
-- 使用 Serilog 进行日志记录
-- 日志输出到控制台和文件
-- 通过 stdio 与 OpenCode 通信
-- 支持从 SQLite 数据库查询 sessionId
-
-### OpenCodeSessionServer
-
-- RESTful API 设计
-- 文件系统存储，按日期分目录 (`yyyy-MM-dd/`)
-- 支持可选 Bearer Token 认证
-- Base64 编码传输 session 数据
-
-## 调试技巧
-
-### 查看 MCP 日志
-```bash
-tail -f OpenCodeSessionMCP/logs/mcp.log
-```
-
-### 测试 API 端点
-```bash
-# 上传会话
-curl -X POST http://localhost:5153/sessions/upload \
-  -H "Content-Type: application/json" \
-  -d '{"sessionId":"test","data":"SGVsbG8gV29ybGQ="}'
-
-# 列出会话
-curl http://localhost:5153/sessions
-
-# 下载会话
-curl http://localhost:5153/sessions/<id>
-
-# 删除会话
-curl -X DELETE http://localhost:5153/sessions/<id>
+```csharp
+_httpClient.DefaultRequestHeaders.Authorization =
+    new AuthenticationHeaderValue("Bearer", _token);
 ```
 
 ## appsettings.json 配置
 
-### OpenCodeSessionMCP
 ```json
 {
-  "RestApi": {
-    "BaseUrl": "http://localhost:5153",
-    "ApiKey": ""
+  "App": {
+    "GitHub": {
+      "TokenEnvVar": "GITHUB_TOKEN"
+    },
+    "OpenCode": {
+      "CliPath": "opencode"
+    }
   },
-  "OpenCode": {
-    "CliPath": "opencode",
-    "DbPath": "%USERPROFILE%\\.local\\share\\opencode\\opencode.db"
+  "Serilog": {
+    "MinimumLevel": "Debug",
+    "WriteTo": [
+      {
+        "Name": "File",
+        "Args": {
+          "path": "Logs\\.log",
+          "rollingInterval": "Day"
+        }
+      }
+    ],
+    "Overrides": {
+      "Microsoft": "Warning"
+    }
   }
 }
 ```
 
-### OpenCodeSessionServer
+## 本地注册表
+
+存储位置: `%APPDATA%/opencode-sessions/registry.json`
+
+格式:
 ```json
 {
-  "Storage": {
-    "RootPath": "./sessions"
-  },
-  "Authentication": {
-    "ApiKey": ""
+  "sessions": {
+    "session_abc123": {
+      "gistId": "gist_id_xyz",
+      "title": "Session Title",
+      "updatedAt": 1234567890
+    }
   }
 }
 ```

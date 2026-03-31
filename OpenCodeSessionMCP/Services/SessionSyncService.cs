@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -11,15 +11,17 @@ namespace OpenCodeSessionMCP.Services;
 public sealed class SessionSyncService
 {
     private readonly OpenCodeService _openCodeService;
-    private readonly AppSettings _settings;
+    private readonly GistService _gistService;
+    private readonly RegistryService _registryService;
     private readonly string _workingDirectory;
 
     public SessionSyncService(
         OpenCodeService openCodeService,
-        IOptions<AppSettings> settings)
+        GistService gistService)
     {
         _openCodeService = openCodeService;
-        _settings = settings.Value;
+        _gistService = gistService;
+        _registryService = new RegistryService();
         _workingDirectory = Directory.GetCurrentDirectory();
     }
 
@@ -50,31 +52,41 @@ public sealed class SessionSyncService
             var sessionData = await _openCodeService.ExportSessionAsync(sessionId, ct);
             Log.Logger.Information("Session content length: {Length} characters", sessionData.Length);
 
-            if (string.IsNullOrEmpty(_settings.RestApi.BaseUrl))
+            if (_registryService.TryGet(sessionId, out var existingGistId))
             {
-                Log.Logger.Warning("API settings are not configured. BaseUrl: {BaseUrl}", _settings.RestApi.BaseUrl);
-                return CreateExportResult("API settings are not configured. Please set the BaseUrl in the configuration.", false);
+                Log.Logger.Information("Updating existing Gist {GistId}", existingGistId);
+                var updated = await _gistService.UpdateGistFileAsync(existingGistId, $"{sessionId}.json", sessionData, ct);
+                if (!updated)
+                {
+                    return CreateExportResult("Failed to update Gist", false);
+                }
+                _registryService.UpdateTitle(sessionId, title);
+                Log.Logger.Information("Session updated successfully in Gist {GistId}", existingGistId);
+                return new ExportResult
+                {
+                    Success = true,
+                    RemoteId = existingGistId,
+                    Message = $"Session updated successfully in Gist: {existingGistId}"
+                };
             }
-
-            var base64Data = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(sessionData));
-            Log.Logger.Information("Read exported session data, size: {Size} bytes", base64Data.Length);
-
-            var effectiveServerUrl = _settings.RestApi.BaseUrl;
-            var effectiveApiKey = _settings.RestApi.ApiKey;
-
-            Log.Logger.Information("Uploading to server: {ServerUrl}", effectiveServerUrl);
-
-            var apiService = new RestApiService(new HttpClient(), effectiveServerUrl, effectiveApiKey);
-            var remoteId = await apiService.UploadSessionAsync(sessionId, title, base64Data, ct);
-
-            Log.Logger.Information("Session exported successfully. RemoteId: {RemoteId}", remoteId);
-
-            return new ExportResult
+            else
             {
-                Success = true,
-                RemoteId = remoteId,
-                Message = $"Session exported successfully. Remote ID: {remoteId}"
-            };
+                Log.Logger.Information("Creating new Gist for session {SessionId}", sessionId);
+                var gist = await _gistService.CreateGistAsync($"OpenCode Session: {sessionId}", $"{sessionId}.json", sessionData, ct);
+                if (gist == null)
+                {
+                    return CreateExportResult("Failed to create Gist", false);
+                }
+
+                _registryService.Register(sessionId, gist.Id, title);
+                Log.Logger.Information("Session exported successfully. GistId: {GistId}", gist.Id);
+                return new ExportResult
+                {
+                    Success = true,
+                    RemoteId = gist.Id,
+                    Message = $"Session exported successfully. Gist: {gist.Id}"
+                };
+            }
         }
         catch (TimeoutException ex)
         {
@@ -96,11 +108,11 @@ public sealed class SessionSyncService
         }
         catch (HttpRequestException ex)
         {
-            Log.Logger.Error(ex, "API error during upload. ServerUrl: {ServerUrl}", _settings.RestApi.BaseUrl);
+            Log.Logger.Error(ex, "GitHub API error during upload");
             return new ExportResult
             {
                 Success = false,
-                Error = $"API error: {ex.Message}"
+                Error = $"GitHub API error: {ex.Message}"
             };
         }
         catch (Exception ex)
@@ -114,12 +126,14 @@ public sealed class SessionSyncService
         }
     }
 
-    private async Task<(string? sessionId, string? title)> TryFindSessionIdByPathAsync(string? sessionPath, CancellationToken ct)
+    public async Task<(string? sessionId, string? title)> GetSessionInfoByPathAsync(string? sessionPath, CancellationToken ct = default)
     {
-        Log.Logger.Information("SessionId is not provided, attempting to extract from sessionPath: {SessionPath}", sessionPath);
+        if (string.IsNullOrEmpty(sessionPath))
+        {
+            return (null, null);
+        }
 
-        string sessionId = string.Empty;
-        string title = string.Empty;
+        Log.Logger.Information("Extracting session info from sessionPath: {SessionPath}", sessionPath);
 
         string dbPath;
         try
@@ -151,61 +165,78 @@ public sealed class SessionSyncService
                 WHERE directory = @directory 
                 ORDER BY time_updated DESC 
                 LIMIT 1";
-            command.Parameters.AddWithValue("@directory", sessionPath ?? string.Empty);
+            command.Parameters.AddWithValue("@directory", sessionPath);
 
             using var reader = command.ExecuteReader();
             if (reader.Read())
             {
-                sessionId = reader.GetString(0);
-                title = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                var sessionId = reader.GetString(0);
+                var title = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                Log.Logger.Information("Extracted SessionId: {SessionId}, Title: {Title} from SessionPath: {SessionPath}", sessionId, title, sessionPath);
+                return (sessionId, title);
             }
-
-            Log.Logger.Information("SQLite query executed. SessionId: {SessionId}, Title: {Title}", sessionId, title);
         }
         catch (Exception ex)
         {
             Log.Logger.Error(ex, "Failed to query SQLite database at: {DbPath}", dbPath);
-            return (null, null);
         }
 
-        if (string.IsNullOrEmpty(sessionId)) return (null, null);
-
-        Log.Logger.Information("Extracted SessionId: {SessionId}, Title: {Title} from SessionPath: {SessionPath}", sessionId, title, sessionPath);
-        return (sessionId, title);
-    }
-
-    public async Task<(string? sessionId, string? title)> GetSessionInfoByPathAsync(string sessionPath, CancellationToken ct = default)
-    {
-        return await TryFindSessionIdByPathAsync(sessionPath, ct);
+        return (null, null);
     }
 
     public async Task<ImportResult> DownloadAndImportAsync(
-        string remoteId, CancellationToken ct = default)
+        string sessionId, CancellationToken ct = default)
     {
         string? tempFile = null;
         try
         {
-            Log.Logger.Information("Downloading from server: {ServerUrl}", _settings.RestApi.BaseUrl);
+            if (!_registryService.TryGet(sessionId, out var gistId))
+            {
+                return new ImportResult
+                {
+                    Success = false,
+                    Error = $"Session {sessionId} not found in registry. Please export it first."
+                };
+            }
 
-            var apiService = new RestApiService(new HttpClient(), _settings.RestApi.BaseUrl, _settings.RestApi.ApiKey);
-            var jsonData = await apiService.DownloadSessionAsync(remoteId, ct);
-            Log.Logger.Information("Downloaded data, size: {Size} bytes", jsonData.Length);
+            Log.Logger.Information("Downloading from Gist {GistId}", gistId);
 
-            tempFile = Path.Combine(_workingDirectory, $"import_{remoteId}_{Guid.NewGuid():N}.json");
-            await File.WriteAllTextAsync(tempFile, jsonData, ct);
+            var gist = await _gistService.GetGistAsync(gistId, ct);
+            if (gist == null)
+            {
+                return new ImportResult
+                {
+                    Success = false,
+                    Error = $"Failed to get Gist {gistId}"
+                };
+            }
+
+            if (!gist.Files.TryGetValue($"{sessionId}.json", out var fileInfo))
+            {
+                return new ImportResult
+                {
+                    Success = false,
+                    Error = $"File {sessionId}.json not found in Gist {gistId}"
+                };
+            }
+
+            Log.Logger.Information("Downloaded data, size: {Size} bytes", fileInfo.Content.Length);
+
+            tempFile = Path.Combine(_workingDirectory, $"import_{sessionId}_{Guid.NewGuid():N}.json");
+            await File.WriteAllTextAsync(tempFile, fileInfo.Content, ct);
             Log.Logger.Information("Saved to temp file: {File}", tempFile);
 
             Log.Logger.Information("Calling OpenCode import");
             await _openCodeService.ImportSessionAsync(tempFile, ct);
             Log.Logger.Information("OpenCode import completed");
 
-            Log.Logger.Information("Session imported successfully. SessionId: {SessionId}", remoteId);
+            Log.Logger.Information("Session imported successfully. SessionId: {SessionId}", sessionId);
 
             return new ImportResult
             {
                 Success = true,
-                SessionId = remoteId,
-                Message = $"Session imported successfully"
+                SessionId = sessionId,
+                Message = $"Session imported successfully from Gist: {gistId}"
             };
         }
         catch (TimeoutException ex)
@@ -228,11 +259,11 @@ public sealed class SessionSyncService
         }
         catch (HttpRequestException ex)
         {
-            Log.Logger.Error(ex, "API error during download. RemoteId: {RemoteId}", remoteId);
+            Log.Logger.Error(ex, "GitHub API error during download");
             return new ImportResult
             {
                 Success = false,
-                Error = $"API error: {ex.Message}"
+                Error = $"GitHub API error: {ex.Message}"
             };
         }
         catch (Exception ex)
@@ -261,34 +292,68 @@ public sealed class SessionSyncService
         }
     }
 
-    public async Task<ListRemoteSessionsResult> ListRemoteSessionsAsync(CancellationToken ct = default)
+    public Task<ListSessionsResult> ListSessionsAsync(CancellationToken ct = default)
+    {
+        var sessions = _registryService.GetAllWithId();
+        Log.Logger.Information("Found {Count} registered sessions", sessions.Count);
+
+        return Task.FromResult(new ListSessionsResult
+        {
+            Success = true,
+            Sessions = sessions.Select(s => new SessionRegistryInfo
+            {
+                SessionId = s.SessionId,
+                Title = s.Entry.Title,
+                UpdatedAt = s.Entry.UpdatedAt
+            }).ToList()
+        });
+    }
+
+    public async Task<DeleteResult> DeleteSessionAsync(string sessionId, CancellationToken ct = default)
     {
         try
         {
-            var apiService = new RestApiService(new HttpClient(), _settings.RestApi.BaseUrl, _settings.RestApi.ApiKey);
-            var sessions = await apiService.ListSessionsAsync(ct);
+            if (!_registryService.TryGet(sessionId, out var gistId))
+            {
+                return new DeleteResult
+                {
+                    Success = false,
+                    Error = $"Session {sessionId} not found in registry"
+                };
+            }
 
-            Log.Logger.Information("Found {Count} sessions", sessions.Count);
+            var deleted = await _gistService.DeleteGistAsync(gistId, ct);
+            if (!deleted)
+            {
+                return new DeleteResult
+                {
+                    Success = false,
+                    Error = $"Failed to delete Gist {gistId}"
+                };
+            }
 
-            return new ListRemoteSessionsResult
+            _registryService.Unregister(sessionId);
+            Log.Logger.Information("Session deleted successfully. SessionId: {SessionId}, GistId: {GistId}", sessionId, gistId);
+
+            return new DeleteResult
             {
                 Success = true,
-                Sessions = sessions.ToList()
+                Message = $"Session deleted successfully"
             };
         }
         catch (HttpRequestException ex)
         {
-            Log.Logger.Error(ex, "API error listing sessions. ServerUrl: {ServerUrl}", _settings.RestApi.BaseUrl);
-            return new ListRemoteSessionsResult
+            Log.Logger.Error(ex, "GitHub API error during delete");
+            return new DeleteResult
             {
                 Success = false,
-                Error = $"API error: {ex.Message}"
+                Error = $"GitHub API error: {ex.Message}"
             };
         }
         catch (Exception ex)
         {
-            Log.Logger.Error(ex, "Unexpected error listing sessions");
-            return new ListRemoteSessionsResult
+            Log.Logger.Error(ex, "Unexpected error during delete");
+            return new DeleteResult
             {
                 Success = false,
                 Error = $"Unexpected error: {ex.Message}"
@@ -312,4 +377,25 @@ public sealed class SessionSyncService
             Error = message
         };
     }
+}
+
+public class ListSessionsResult
+{
+    public bool Success { get; set; }
+    public List<SessionRegistryInfo> Sessions { get; set; } = new();
+    public string? Error { get; set; }
+}
+
+public class SessionRegistryInfo
+{
+    public string SessionId { get; set; } = string.Empty;
+    public string Title { get; set; } = string.Empty;
+    public long UpdatedAt { get; set; }
+}
+
+public class DeleteResult
+{
+    public bool Success { get; set; }
+    public string? Message { get; set; }
+    public string? Error { get; set; }
 }
