@@ -3,4 +3,5 @@
     <File Path="AGENTS.md" />
   </Folder>
   <Project Path="OpenCodeSessionMCP/OpenCodeSessionMCP.csproj" />
+  <Project Path="OpenCodeSessionCLI/OpenCodeSessionCLI.csproj" />
 </Solution>
